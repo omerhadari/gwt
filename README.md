@@ -18,6 +18,9 @@ eval "$(gwt config shell init bash)"  # or zsh
 # tab completion (optional)
 eval "$(gwt config completion bash)"  # or zsh
 ```
+There is intentionally no installation one-liner a-la `curl -o` here.
+This is a simple tool that doesn't do much, but it does run git commands
+and makes it easy to add hooks, please make sure you're fine with how it works before using (as the license says - authors bare no responsibility etc...).
 
 
 ## Usage
