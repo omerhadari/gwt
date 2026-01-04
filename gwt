@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { echo "gwt: $*" >&2; exit 1; }
+warn() { echo "gwt: $*" >&2; }
+
+require_git_repo() { git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"; }
+
+require_shell_integration() { [[ -n "${GWT_DIRECTIVE_FILE:-}" ]] || die "shell integration required. Run: eval \"\$(gwt config shell init bash)\""; }
+
+get_base_worktree() {
+    git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}'
+}
+
+get_worktree_path_for_branch() {
+    local root; root=$(git rev-parse --show-toplevel)
+    echo "$(dirname "$root")/$(basename "$root").$(echo "$1" | sed 's|[/\\]|--|g')"
+}
+
+find_worktree_for_branch() {
+    local target="$1" path="" line
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) path="${line#worktree }" ;;
+            "branch "*) [[ "${line#branch refs/heads/}" == "$target" ]] && { echo "$path"; return 0; } ;;
+            "") path="" ;;
+        esac
+    done < <(git worktree list --porcelain; echo "")
+    return 1
+}
+
+write_directive() { [[ -n "${GWT_DIRECTIVE_FILE:-}" ]] && echo "$1" >> "$GWT_DIRECTIVE_FILE"; }
+
+
+
+cmd_help() {
+    cat <<'EOF'
+usage: gwt <command> [<args>]
+
+Git worktree manager - quickly switch between worktrees
+
+Commands:
+  list              List all worktrees
+  switch <branch>   Switch to a worktree (creates if needed)
+  remove <branch>   Remove a worktree
+  select            Interactive worktree picker (requires fzf)
+  config            Configuration and shell integration
+
+Options:
+  --help, -h        Show this help
+
+Run 'gwt <command> --help' for command-specific help.
+EOF
+}
+
+cmd_list() {
+    require_git_repo
+    git worktree list
+}
+
+cmd_switch() {
+    require_git_repo; require_shell_integration
+    local create=false base="" target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --create|-c) create=true; shift ;;
+            --base) [[ $# -lt 2 ]] && die "switch: --base requires an argument"; base="$2"; shift 2 ;;
+            --help|-h) cat <<'EOF'
+usage: gwt switch [options] <branch>
+
+Switch to a worktree, optionally creating it.
+
+Arguments:
+  <branch>          Branch name, or special target:
+                    -  - previous worktree
+
+Options:
+  --create, -c      Create worktree/branch if needed
+  --base <branch>   Base branch for new branches (default: HEAD)
+  --help, -h        Show this help
+EOF
+                return 0 ;;
+            -) [[ -n "$target" ]] && die "switch: unexpected argument: $1"; target="-"; shift ;;
+            -*) die "switch: unknown option: $1" ;;
+            *) [[ -n "$target" ]] && die "switch: unexpected argument: $1"; target="$1"; shift ;;
+        esac
+    done
+    [[ -z "$target" ]] && die "switch: branch name required"
+
+    # Resolve special target
+    [[ "$target" == "-" ]] && { target=$(git config --get gwt.previous-branch 2>/dev/null || true); [[ -z "$target" ]] && die "switch: no previous worktree"; }
+
+    local current_branch existing_worktree
+    current_branch=$(git branch --show-current)
+
+    if existing_worktree=$(find_worktree_for_branch "$target"); then
+        [[ -n "$current_branch" ]] && git config gwt.previous-branch "$current_branch"
+        echo "Switching to $target"; echo "$existing_worktree"
+        write_directive "cd '$existing_worktree'"; return 0
+    fi
+
+    [[ "$create" != true ]] && die "switch: worktree for branch '$target' not found (use --create to create)"
+
+    local worktree_path; worktree_path=$(get_worktree_path_for_branch "$target")
+    if git rev-parse --verify "refs/heads/$target" >/dev/null 2>&1; then
+        git worktree add "$worktree_path" "$target" >/dev/null || die "switch: failed to create worktree"
+    else
+        [[ -z "$base" ]] && base="HEAD"
+        git worktree add -b "$target" "$worktree_path" "$base" >/dev/null || die "switch: failed to create worktree and branch"
+    fi
+    [[ -n "$current_branch" ]] && git config gwt.previous-branch "$current_branch"
+    echo "Created worktree for $target"; echo "$worktree_path"
+    write_directive "cd '$worktree_path'"
+}
+
+cmd_remove() {
+    require_git_repo; require_shell_integration
+    local force=false force_delete=false no_delete_branch=false target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=true; shift ;;
+            --force-delete|-D) force_delete=true; shift ;;
+            --no-delete-branch) no_delete_branch=true; shift ;;
+            --help|-h) cat <<'EOF'
+usage: gwt remove [options] [<branch>]
+
+Remove a worktree and optionally its branch.
+
+Arguments:
+  <branch>            Branch name (default: current branch)
+
+Options:
+  --force, -f         Remove even with uncommitted changes
+  --force-delete, -D  Delete branch even if not merged
+  --no-delete-branch  Remove worktree but keep the branch
+  --help, -h          Show this help
+EOF
+                return 0 ;;
+            -*) die "remove: unknown option: $1" ;;
+            *) [[ -n "$target" ]] && die "remove: unexpected argument: $1"; target="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && { target=$(git branch --show-current); [[ -z "$target" ]] && die "remove: could not determine current branch"; }
+
+    local worktree_path; worktree_path=$(find_worktree_for_branch "$target") || die "remove: worktree for branch '$target' not found"
+    local current_worktree is_current=false git_dir
+    current_worktree=$(git rev-parse --show-toplevel)
+    git_dir=$(git rev-parse --git-common-dir)
+    [[ "$worktree_path" == "$current_worktree" ]] && is_current=true
+
+    if [[ "$force" != true ]]; then
+        local status; status=$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)
+        [[ -n "$status" ]] && die "remove: worktree has uncommitted changes (use --force to override)"
+    fi
+
+    if [[ "$is_current" == true ]]; then
+        local base_worktree
+        base_worktree=$(get_base_worktree)
+        [[ "$base_worktree" == "$worktree_path" ]] && die "remove: cannot remove base worktree"
+        echo "Switching to base worktree before removing"
+        write_directive "cd '$base_worktree'"
+    fi
+
+    if [[ "$force" == true ]]; then git worktree remove --force "$worktree_path" 2>/dev/null || die "remove: failed to remove worktree"
+    else git worktree remove "$worktree_path" 2>/dev/null || die "remove: failed to remove worktree"; fi
+    echo "Removed worktree for $target"
+
+    if [[ "$no_delete_branch" != true ]]; then
+        # Use -C to run from git dir in case cwd was deleted (removing current worktree)
+        if [[ "$force_delete" == true ]]; then git -C "$git_dir" branch -D "$target" >/dev/null 2>&1 || warn "remove: could not delete branch '$target'"; echo "Deleted branch $target"
+        else git -C "$git_dir" branch -d "$target" >/dev/null 2>&1 || die "remove: branch '$target' is not merged (use --force-delete to override, or --no-delete-branch to keep)"; echo "Deleted branch $target"; fi
+    fi
+}
+
+cmd_select() {
+    require_git_repo
+    command -v fzf >/dev/null 2>&1 || die "fzf not found."
+
+    local worktree_list fzf_opts=() selection
+    worktree_list=$(git worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch /{b=substr($0,19)} /^detached/{b="(detached)"} /^$/{if(p&&b)print b"\t"p; p=b=""}')
+
+    if [[ -t 0 ]]; then
+        fzf_opts+=(--preview 'git -C {2} log --oneline -10 2>/dev/null || echo "No commits"')
+    else
+        local q; read -r q; fzf_opts+=(--filter "$q")
+    fi
+
+    selection=$(echo "$worktree_list" | fzf "${fzf_opts[@]}" 2>/dev/null | head -1) || true
+    [[ -z "$selection" ]] && return 0
+    cmd_switch "${selection%%$'\t'*}"
+}
+
+cmd_config() {
+    if [[ $# -eq 0 ]]; then
+        die "config: subcommand required (shell, hooks, completion, show, state)"
+    fi
+
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        shell)
+            cmd_config_shell "$@"
+            ;;
+        hooks)
+            cmd_config_hooks "$@"
+            ;;
+        completion)
+            cmd_config_completion "$@"
+            ;;
+        show)
+            cmd_config_show "$@"
+            ;;
+        state)
+            cmd_config_state "$@"
+            ;;
+        --help|-h)
+            cat <<'EOF'
+usage: gwt config <subcommand>
+
+Configuration management.
+
+Subcommands:
+  shell init <shell>    Output shell integration code
+  hooks install         Install git hooks for gwt integration
+  hooks set-post-create Set post-create hook script
+  completion <shell>    Output shell completion script
+  show                  Show current configuration
+  state <key>           Manage state values
+EOF
+            ;;
+        *)
+            die "config: unknown subcommand: $subcmd"
+            ;;
+    esac
+}
+
+cmd_config_hooks() {
+    if [[ $# -eq 0 ]]; then
+        die "config hooks: subcommand required (install, set-post-create)"
+    fi
+
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        install)
+            local global=false hooks_dir hook_file
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --global) global=true; shift ;;
+                    -*) die "config hooks install: unknown option: $1" ;;
+                    *) break ;;
+                esac
+            done
+
+            if [[ "$global" == true ]]; then
+                hooks_dir=$(git config --global core.hooksPath 2>/dev/null || true)
+                if [[ -z "$hooks_dir" ]]; then
+                    hooks_dir="$HOME/.git-hooks"
+                    git config --global core.hooksPath "$hooks_dir"
+                fi
+            else
+                require_git_repo
+                hooks_dir="$(git rev-parse --git-common-dir)/hooks"
+                git config --local core.hooksPath "$hooks_dir"
+            fi
+            mkdir -p "$hooks_dir"
+
+            hook_file="$hooks_dir/post-checkout"
+            if [[ -f "$hook_file" ]] && ! grep -q "gwt post-checkout hook" "$hook_file" 2>/dev/null; then
+                die "config hooks install: $hook_file already exists (not managed by gwt)"
+            fi
+
+            cat > "$hook_file" <<'HOOK'
+#!/bin/bash
+# gwt post-checkout hook - runs gwt.hook.post-create on worktree add
+# Installed by: gwt config hooks install
+
+prev_head="$1"
+new_head="$2"
+branch_flag="$3"
+
+# Only run on branch checkout (not file checkout)
+[[ "$branch_flag" != "1" ]] && exit 0
+
+# Only run on worktree add (prev_head is null ref)
+[[ "$prev_head" != "0000000000000000000000000000000000000000" ]] && exit 0
+
+branch=$(git branch --show-current)
+worktree_path=$(git rev-parse --show-toplevel)
+
+# Run global hook first, then local
+for scope in --global --local; do
+    hook_script=$(git config $scope gwt.hook.post-create 2>/dev/null) || continue
+    [[ -z "$hook_script" ]] && continue
+    if [[ -x "$hook_script" ]]; then
+        "$hook_script" "$branch" "$worktree_path" || echo "gwt: hook '$hook_script' failed" >&2
+    else
+        echo "gwt: hook '$hook_script' is not executable, skipping" >&2
+    fi
+done
+HOOK
+            chmod +x "$hook_file"
+            echo "Installed post-checkout hook to $hook_file"
+            ;;
+        set-post-create)
+            local global=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --global) global=true; shift ;;
+                    -*) die "config hooks set-post-create: unknown option: $1" ;;
+                    *) break ;;
+                esac
+            done
+
+            if [[ $# -eq 0 ]]; then
+                die "config hooks set-post-create: script path required"
+            fi
+
+            local script_path="$1"
+            if [[ "$global" == true ]]; then
+                git config --global gwt.hook.post-create "$script_path"
+            else
+                require_git_repo
+                git config --local gwt.hook.post-create "$script_path"
+            fi
+            echo "Set post-create hook to $script_path"
+            ;;
+        *)
+            die "config hooks: unknown subcommand: $subcmd"
+            ;;
+    esac
+}
+
+cmd_config_shell() {
+    if [[ $# -eq 0 ]]; then
+        die "config shell: subcommand required (init)"
+    fi
+
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        init)
+            if [[ $# -eq 0 ]]; then
+                die "config shell init: shell type required (bash, zsh)"
+            fi
+            local shell_type="$1"
+            case "$shell_type" in
+                bash|zsh)
+                    cat <<'SHELL_WRAPPER'
+# gwt shell integration
+# Add to your ~/.bashrc or ~/.zshrc:
+#   eval "$(gwt config shell init bash)"
+
+gwt() {
+    local directive_file
+    directive_file=$(mktemp)
+
+    GWT_DIRECTIVE_FILE="$directive_file" command gwt "$@"
+    local exit_code=$?
+
+    if [[ -f "$directive_file" ]]; then
+        while IFS= read -r line; do
+            eval "$line"
+        done < "$directive_file"
+        rm -f "$directive_file"
+    fi
+
+    return $exit_code
+}
+SHELL_WRAPPER
+                    ;;
+                *)
+                    die "config shell init: unsupported shell: $shell_type"
+                    ;;
+            esac
+            ;;
+        *)
+            die "config shell: unknown subcommand: $subcmd"
+            ;;
+    esac
+}
+
+cmd_config_completion() {
+    if [[ $# -eq 0 ]]; then
+        die "config completion: shell type required (bash, zsh)"
+    fi
+
+    local shell_type="$1"
+    case "$shell_type" in
+        bash)
+            cat <<'BASH_COMPLETION'
+# gwt bash completion
+# Add to your ~/.bashrc:
+#   eval "$(gwt config completion bash)"
+
+_gwt() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local commands="switch list remove select config help"
+
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        COMPREPLY=($(compgen -W "$commands --help --version" -- "$cur"))
+        return
+    fi
+
+    local cmd="${COMP_WORDS[1]}"
+    case "$cmd" in
+        switch|sw)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--create -c --base --help" -- "$cur"))
+            elif [[ "$prev" == "--base" ]]; then
+                local branches
+                branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+                COMPREPLY=($(compgen -W "$branches" -- "$cur"))
+            else
+                local branches
+                branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
+                COMPREPLY=($(compgen -W "$branches -" -- "$cur"))
+            fi
+            ;;
+        remove|rm)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--force -f --force-delete -D --no-delete-branch --help" -- "$cur"))
+            else
+                local wt_branches
+                wt_branches=$(git worktree list --porcelain 2>/dev/null | grep '^branch ' | sed 's|^branch refs/heads/||')
+                COMPREPLY=($(compgen -W "$wt_branches" -- "$cur"))
+            fi
+            ;;
+        select)
+            COMPREPLY=($(compgen -W "--help" -- "$cur"))
+            ;;
+        list|ls)
+            COMPREPLY=($(compgen -W "--help" -- "$cur"))
+            ;;
+        config)
+            if [[ $COMP_CWORD -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "shell hooks completion show state --help" -- "$cur"))
+            elif [[ $COMP_CWORD -eq 3 ]]; then
+                case "${COMP_WORDS[2]}" in
+                    shell) COMPREPLY=($(compgen -W "init" -- "$cur")) ;;
+                    hooks) COMPREPLY=($(compgen -W "install set-post-create" -- "$cur")) ;;
+                    completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
+                    state) COMPREPLY=($(compgen -W "previous-branch" -- "$cur")) ;;
+                esac
+            elif [[ $COMP_CWORD -eq 4 ]]; then
+                case "${COMP_WORDS[2]}" in
+                    shell)
+                        if [[ "${COMP_WORDS[3]}" == "init" ]]; then
+                            COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+                        fi
+                        ;;
+                    hooks)
+                        if [[ "${COMP_WORDS[3]}" == "set-post-create" ]]; then
+                            COMPREPLY=($(compgen -f -- "$cur"))
+                        elif [[ "${COMP_WORDS[3]}" == "install" ]]; then
+                            COMPREPLY=($(compgen -W "--global" -- "$cur"))
+                        fi
+                        ;;
+                esac
+            elif [[ $COMP_CWORD -eq 5 ]]; then
+                case "${COMP_WORDS[2]}" in
+                    hooks)
+                        if [[ "${COMP_WORDS[3]}" == "set-post-create" && "${COMP_WORDS[4]}" == "--global" ]]; then
+                            COMPREPLY=($(compgen -f -- "$cur"))
+                        fi
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+}
+
+complete -F _gwt gwt
+BASH_COMPLETION
+            ;;
+        zsh)
+            cat <<'ZSH_COMPLETION'
+# gwt zsh completion
+# Add to your ~/.zshrc:
+#   eval "$(gwt config completion zsh)"
+
+_gwt() {
+    local cur="${words[CURRENT]}"
+
+    if (( CURRENT == 2 )); then
+        local -a commands=(
+            'switch:Switch to a worktree'
+            'list:List all worktrees'
+            'remove:Remove a worktree'
+            'select:Interactive worktree picker'
+            'config:Configuration management'
+            'help:Show help'
+        )
+        _describe 'command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        switch|sw)
+            if [[ "$cur" == -* ]]; then
+                local -a opts=('--create' '-c' '--base' '--help')
+                _describe 'option' opts
+            elif [[ "${words[CURRENT-1]}" == "--base" ]]; then
+                local -a branches=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)"})
+                _describe 'branch' branches
+            else
+                local -a branches=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)"})
+                local -a special=('-:previous worktree')
+                _describe 'branch' branches
+                _describe 'special' special
+            fi
+            ;;
+        remove|rm)
+            if [[ "$cur" == -* ]]; then
+                local -a opts=('--force' '-f' '--force-delete' '-D' '--no-delete-branch' '--help')
+                _describe 'option' opts
+            else
+                local -a branches=(${(f)"$(git worktree list --porcelain 2>/dev/null | grep '^branch ' | sed 's|^branch refs/heads/||')"})
+                _describe 'branch' branches
+            fi
+            ;;
+        list|ls|select)
+            _describe 'option' '(--help)'
+            ;;
+        config)
+            if (( CURRENT == 3 )); then
+                local -a cmds=('shell' 'hooks' 'completion' 'show' 'state')
+                _describe 'subcommand' cmds
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    shell) _describe 'action' '(init)' ;;
+                    hooks) _describe 'action' '(install set-post-create)' ;;
+                    completion) _describe 'shell' '(bash zsh)' ;;
+                    state) _describe 'key' '(previous-branch)' ;;
+                esac
+            elif (( CURRENT == 5 )); then
+                case "${words[3]}" in
+                    shell)
+                        if [[ "${words[4]}" == "init" ]]; then
+                            _describe 'shell' '(bash zsh)'
+                        fi
+                        ;;
+                    hooks)
+                        if [[ "${words[4]}" == "set-post-create" ]]; then
+                            _files
+                        elif [[ "${words[4]}" == "install" ]]; then
+                            _describe 'option' '(--global)'
+                        fi
+                        ;;
+                esac
+            elif (( CURRENT == 6 )); then
+                if [[ "${words[3]}" == "hooks" && "${words[4]}" == "set-post-create" && "${words[5]}" == "--global" ]]; then
+                    _files
+                fi
+            fi
+            ;;
+    esac
+}
+
+compdef _gwt gwt
+ZSH_COMPLETION
+            ;;
+        *)
+            die "config completion: unsupported shell: $shell_type"
+            ;;
+    esac
+}
+
+cmd_config_show() {
+    require_git_repo
+    git config --show-scope --get-regexp '^gwt\.' 2>/dev/null || true
+}
+
+cmd_config_state() {
+    require_git_repo
+
+    if [[ $# -eq 0 ]]; then
+        die "config state: key required (previous-branch)"
+    fi
+
+    local key="$1"
+    shift
+
+    case "$key" in
+        previous-branch)
+            git config --get gwt.previous-branch
+            ;;
+        *)
+            die "config state: unknown key: $key"
+            ;;
+    esac
+}
+
+main() {
+    # No args: show help
+    if [[ $# -eq 0 ]]; then
+        cmd_help
+        exit 0
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        --help|-h|help)
+            cmd_help
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        switch|sw)
+            cmd_switch "$@"
+            ;;
+        remove|rm)
+            cmd_remove "$@"
+            ;;
+        select)
+            cmd_select "$@"
+            ;;
+        config)
+            cmd_config "$@"
+            ;;
+        *)
+            die "unknown command: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
