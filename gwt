@@ -60,10 +60,11 @@ cmd_list() {
 
 cmd_switch() {
     require_git_repo; require_shell_integration
-    local create=false base="" target=""
+    local create=false carry=false base="" target=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --create|-c) create=true; shift ;;
+            --carry) carry=true; shift ;;
             --base) [[ $# -lt 2 ]] && die "switch: --base requires an argument"; base="$2"; shift 2 ;;
             --help|-h) cat <<'EOF'
 usage: gwt switch [options] <branch>
@@ -76,6 +77,7 @@ Arguments:
 
 Options:
   --create, -c      Create worktree/branch if needed
+  --carry           Copy working state (staged, unstaged, untracked) to new worktree (requires --create)
   --base <branch>   Base branch for new branches (default: HEAD)
   --help, -h        Show this help
 EOF
@@ -86,6 +88,7 @@ EOF
         esac
     done
     [[ -z "$target" ]] && die "switch: branch name required"
+    [[ "$carry" == true && "$create" != true ]] && die "switch: --carry requires --create"
 
     # Resolve special target
     [[ "$target" == "-" ]] && { target=$(git config --get gwt.previous-branch 2>/dev/null || true); [[ -z "$target" ]] && die "switch: no previous worktree"; }
@@ -101,6 +104,24 @@ EOF
 
     [[ "$create" != true ]] && die "switch: worktree for branch '$target' not found (use --create to create)"
 
+    # Capture state before worktree creation (all read-only operations on source)
+    local carry_staged="" carry_unstaged="" carry_untracked_dir=""
+    if [[ "$carry" == true ]]; then
+        carry_staged=$(mktemp)
+        git diff --cached --binary > "$carry_staged" 2>/dev/null || true
+
+        carry_unstaged=$(mktemp)
+        git diff --binary > "$carry_unstaged" 2>/dev/null || true
+
+        carry_untracked_dir=$(mktemp -d)
+        local untracked_file
+        while IFS= read -r untracked_file; do
+            [[ -z "$untracked_file" ]] && continue
+            mkdir -p "$carry_untracked_dir/$(dirname "$untracked_file")"
+            cp -a "$untracked_file" "$carry_untracked_dir/$untracked_file"
+        done < <(git ls-files --others --exclude-standard)
+    fi
+
     local worktree_path; worktree_path=$(get_worktree_path_for_branch "$target")
     if git rev-parse --verify "refs/heads/$target" >/dev/null 2>&1; then
         git worktree add "$worktree_path" "$target" >/dev/null || die "switch: failed to create worktree"
@@ -108,6 +129,36 @@ EOF
         [[ -z "$base" ]] && base="HEAD"
         git worktree add -b "$target" "$worktree_path" "$base" >/dev/null || die "switch: failed to create worktree and branch"
     fi
+
+    # Apply carried state to new worktree
+    if [[ "$carry" == true ]]; then
+        # Apply staged changes
+        if [[ -s "$carry_staged" ]]; then
+            if ! git -C "$worktree_path" apply --cached "$carry_staged" 2>/dev/null; then
+                warn "switch: could not apply staged changes to new worktree"
+            else
+                # Write staged content to working tree
+                git -C "$worktree_path" checkout -- . 2>/dev/null || true
+            fi
+        fi
+
+        # Apply unstaged changes
+        if [[ -s "$carry_unstaged" ]]; then
+            if ! git -C "$worktree_path" apply "$carry_unstaged" 2>/dev/null; then
+                warn "switch: could not apply unstaged changes to new worktree"
+            fi
+        fi
+
+        # Copy untracked files
+        if [[ -d "$carry_untracked_dir" ]] && [[ -n "$(ls -A "$carry_untracked_dir" 2>/dev/null)" ]]; then
+            cp -a "$carry_untracked_dir"/. "$worktree_path"/ 2>/dev/null || true
+        fi
+
+        # Clean up temp files
+        rm -f "$carry_staged" "$carry_unstaged"
+        rm -rf "$carry_untracked_dir"
+    fi
+
     [[ -n "$current_branch" ]] && git config gwt.previous-branch "$current_branch"
     echo "Created worktree for $target"; echo "$worktree_path"
     write_directive "cd '$worktree_path'"
@@ -413,7 +464,7 @@ _gwt() {
     case "$cmd" in
         switch|sw)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "--create -c --base --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "--create -c --carry --base --help" -- "$cur"))
             elif [[ "$prev" == "--base" ]]; then
                 local branches
                 branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)
@@ -505,7 +556,7 @@ _gwt() {
     case "${words[2]}" in
         switch|sw)
             if [[ "$cur" == -* ]]; then
-                local -a opts=('--create' '-c' '--base' '--help')
+                local -a opts=('--create' '-c' '--carry' '--base' '--help')
                 _describe 'option' opts
             elif [[ "${words[CURRENT-1]}" == "--base" ]]; then
                 local -a branches=(${(f)"$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null)"})

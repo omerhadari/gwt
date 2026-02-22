@@ -1040,6 +1040,283 @@ test_completion_unknown_shell_fails() {
 }
 
 # =============================================================================
+# Phase 9: Carry Flag Tests
+# =============================================================================
+
+test_carry_without_create_fails() {
+    run_gwt switch --carry nonexistent
+    assert_exit_code 1
+    assert_stderr_contains "requires --create"
+}
+
+test_carry_in_help_text() {
+    run_gwt switch --help
+    assert_exit_code 0
+    assert_stdout_contains "--carry"
+}
+
+test_carry_clean_working_directory() {
+    # Clean repo, no staged/unstaged/untracked changes
+    run_gwt switch -c --carry carry-clean-noop
+    assert_exit_code 0
+    # New worktree should exist and be clean
+    local wt_path="../$(basename "$TEST_DIR").carry-clean-noop"
+    [[ -d "$wt_path" ]]
+    local status
+    status=$(git -C "$wt_path" status --porcelain)
+    [[ -z "$status" ]]
+}
+
+test_carry_staged_changes() {
+    # Stage a new file (do NOT commit)
+    echo "staged-content" > staged.txt
+    git add staged.txt
+
+    local before_status
+    before_status=$(git status --porcelain)
+
+    run_gwt switch -c --carry carry-staged
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-staged"
+    # File should exist on disk and be staged in new worktree
+    [[ -f "$wt_path/staged.txt" ]]
+    local cached_diff
+    cached_diff=$(git -C "$wt_path" diff --cached --name-only)
+    [[ "$cached_diff" == *"staged.txt"* ]]
+
+    # Source should be unchanged
+    local after_status
+    after_status=$(git status --porcelain)
+    [[ "$before_status" == "$after_status" ]]
+}
+
+test_carry_unstaged_changes() {
+    # Modify a committed file WITHOUT staging
+    echo "modified-content" >> file.txt
+
+    local before_diff
+    before_diff=$(git diff)
+
+    run_gwt switch -c --carry carry-unstaged
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-unstaged"
+    # Unstaged change should appear in git diff (not cached)
+    local unstaged_diff
+    unstaged_diff=$(git -C "$wt_path" diff --name-only)
+    [[ "$unstaged_diff" == *"file.txt"* ]]
+    # Nothing should be staged
+    local cached_diff
+    cached_diff=$(git -C "$wt_path" diff --cached --name-only)
+    [[ -z "$cached_diff" ]]
+
+    # Source should be unchanged
+    local after_diff
+    after_diff=$(git diff)
+    [[ "$before_diff" == "$after_diff" ]]
+}
+
+test_carry_untracked_files() {
+    # Plain text file
+    echo "untracked-content" > new-file.txt
+    # Nested subdirectory
+    mkdir -p src/utils
+    echo "code" > src/utils/helper.sh
+    # Binary file
+    printf '\x00\x01\x02' > binary.dat
+    # Executable script
+    echo '#!/bin/bash' > script.sh
+    chmod +x script.sh
+
+    run_gwt switch -c --carry carry-untracked
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-untracked"
+
+    # Plain file: exists with correct content
+    [[ -f "$wt_path/new-file.txt" ]]
+    [[ "$(cat "$wt_path/new-file.txt")" == "untracked-content" ]]
+    # Nested file: exists with correct content
+    [[ -f "$wt_path/src/utils/helper.sh" ]]
+    [[ "$(cat "$wt_path/src/utils/helper.sh")" == "code" ]]
+    # Binary file: byte-identical
+    [[ -f "$wt_path/binary.dat" ]]
+    cmp -s "binary.dat" "$wt_path/binary.dat"
+    # Executable: permission preserved
+    [[ -x "$wt_path/script.sh" ]]
+
+    # Source still has all files
+    [[ -f "new-file.txt" ]]
+    [[ -f "src/utils/helper.sh" ]]
+    [[ -f "binary.dat" ]]
+    [[ -x "script.sh" ]]
+}
+
+test_carry_ignored_files_not_carried() {
+    echo "*.log" > .gitignore
+    git add .gitignore
+    git commit -q -m "add gitignore"
+    echo "debug" > app.log
+
+    run_gwt switch -c --carry carry-no-ignored
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-no-ignored"
+    # Ignored file should NOT be in new worktree
+    [[ ! -f "$wt_path/app.log" ]]
+    # Source should still have it
+    [[ -f "app.log" ]]
+}
+
+test_carry_mixed_all_three_categories() {
+    # Staged new file
+    echo "staged-content" > staged.txt
+    git add staged.txt
+
+    # Unstaged change to tracked file
+    echo "modified" >> file.txt
+
+    # Untracked file
+    echo "untracked" > untracked.txt
+
+    local before_status
+    before_status=$(git status --porcelain)
+
+    run_gwt switch -c --carry carry-mixed
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-mixed"
+
+    # staged.txt should be staged
+    local cached
+    cached=$(git -C "$wt_path" diff --cached --name-only)
+    [[ "$cached" == *"staged.txt"* ]]
+
+    # file.txt should have unstaged modification
+    local unstaged
+    unstaged=$(git -C "$wt_path" diff --name-only)
+    [[ "$unstaged" == *"file.txt"* ]]
+
+    # untracked.txt should exist and be untracked
+    [[ -f "$wt_path/untracked.txt" ]]
+    local untracked_list
+    untracked_list=$(git -C "$wt_path" ls-files --others --exclude-standard)
+    [[ "$untracked_list" == *"untracked.txt"* ]]
+
+    # Source should be unchanged
+    local after_status
+    after_status=$(git status --porcelain)
+    [[ "$before_status" == "$after_status" ]]
+}
+
+test_carry_same_file_staged_and_unstaged() {
+    # Stage a change
+    echo "v1" >> file.txt
+    git add file.txt
+    # Make a further unstaged edit
+    echo "v2" >> file.txt
+
+    run_gwt switch -c --carry carry-split
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-split"
+
+    # Staged diff should show "v1" addition
+    local cached_diff
+    cached_diff=$(git -C "$wt_path" diff --cached)
+    [[ "$cached_diff" == *"v1"* ]]
+
+    # Unstaged diff should show "v2" addition
+    local unstaged_diff
+    unstaged_diff=$(git -C "$wt_path" diff)
+    [[ "$unstaged_diff" == *"v2"* ]]
+}
+
+test_carry_with_base_branch() {
+    # Create develop branch with extra content
+    git checkout -q -b develop
+    echo "develop content" > develop.txt
+    git add develop.txt
+    git commit -q -m "develop commit"
+    git checkout -q -
+
+    # Stage a change on main
+    echo "staged-on-main" > staged.txt
+    git add staged.txt
+
+    run_gwt switch -c --carry --base develop carry-from-develop
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-from-develop"
+    # New worktree should be based on develop (has develop's file)
+    [[ -f "$wt_path/develop.txt" ]]
+    # Staged change should be present
+    local cached
+    cached=$(git -C "$wt_path" diff --cached --name-only)
+    [[ "$cached" == *"staged.txt"* ]]
+}
+
+test_carry_with_base_conflict_warns() {
+    # Set up diverged content
+    echo "main-content" > file.txt
+    git add file.txt
+    git commit -q -m "main content"
+
+    git checkout -q -b diverged
+    echo "diverged-content" > file.txt
+    git add file.txt
+    git commit -q -m "diverged content"
+    git checkout -q -
+
+    # Unstaged modification on main
+    echo "local-edit" > file.txt
+
+    run_gwt switch -c --carry --base diverged carry-conflict
+    assert_exit_code 0
+
+    local wt_path="../$(basename "$TEST_DIR").carry-conflict"
+    # Worktree should exist
+    [[ -d "$wt_path" ]]
+    # Stderr should contain warning about failed apply
+    assert_stderr_contains "could not apply"
+}
+
+test_carry_fails_if_worktree_creation_fails() {
+    # Create a file at the expected worktree path to block creation
+    local expected_path="../$(basename "$TEST_DIR").carry-blocked"
+    mkdir -p "$expected_path"
+    echo "blocker" > "$expected_path/blocker.txt"
+
+    # Stage a change so there's something to carry
+    echo "staged" > staged.txt
+    git add staged.txt
+
+    local before_status
+    before_status=$(git status --porcelain)
+
+    run_gwt switch -c --carry carry-blocked
+    assert_exit_code 1
+
+    # Source should be unchanged
+    local after_status
+    after_status=$(git status --porcelain)
+    [[ "$before_status" == "$after_status" ]]
+}
+
+test_carry_bash_completion_includes_carry() {
+    run_gwt config completion bash
+    assert_exit_code 0
+    assert_stdout_contains "--carry"
+}
+
+test_carry_zsh_completion_includes_carry() {
+    run_gwt config completion zsh
+    assert_exit_code 0
+    assert_stdout_contains "--carry"
+}
+
+# =============================================================================
 # Run all tests
 # =============================================================================
 
@@ -1135,6 +1412,22 @@ run_test "select with no match doesn't switch" test_select_no_match_no_switch
 run_test "completion bash outputs valid script" test_completion_bash_outputs_valid_script
 run_test "completion zsh outputs valid script" test_completion_zsh_outputs_valid_script
 run_test "completion unknown shell fails" test_completion_unknown_shell_fails
+
+# Phase 9 tests (carry flag)
+run_test "--carry without --create fails" test_carry_without_create_fails
+run_test "--carry appears in help text" test_carry_in_help_text
+run_test "--carry with clean directory succeeds" test_carry_clean_working_directory
+run_test "--carry staged changes carried, source unchanged" test_carry_staged_changes
+run_test "--carry unstaged changes carried, source unchanged" test_carry_unstaged_changes
+run_test "--carry untracked files (nested, binary, permissions, source preserved)" test_carry_untracked_files
+run_test "--carry ignored files are NOT carried" test_carry_ignored_files_not_carried
+run_test "--carry mixed state (staged+unstaged+untracked)" test_carry_mixed_all_three_categories
+run_test "--carry same file staged and unstaged" test_carry_same_file_staged_and_unstaged
+run_test "--carry with --base carries to different branch" test_carry_with_base_branch
+run_test "--carry with --base conflict warns" test_carry_with_base_conflict_warns
+run_test "--carry fails if worktree creation fails" test_carry_fails_if_worktree_creation_fails
+run_test "bash completion includes --carry" test_carry_bash_completion_includes_carry
+run_test "zsh completion includes --carry" test_carry_zsh_completion_includes_carry
 
 # Summary
 echo
